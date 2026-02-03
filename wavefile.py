@@ -7,11 +7,122 @@ from PIL import Image
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QPushButton, QSlider,
                              QFileDialog, QVBoxLayout, QWidget, QLabel, QHBoxLayout,
-                             QFrame)
-from PyQt6.QtGui import QAction
+                             QFrame, QColorDialog, QComboBox, QSpinBox, QProgressBar,
+                             QGroupBox, QCheckBox, QLineEdit, QThread, QMessageBox,
+                             QMenu)
+from PyQt6.QtGui import QAction, QDragEnterEvent, QDropEvent, QColor
 from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput
-from PyQt6.QtCore import QUrl, Qt, QTimer
-from moviepy import AudioFileClip, VideoClip
+from PyQt6.QtCore import QUrl, Qt, QTimer, QThread, pyqtSignal, QMimeData
+from moviepy import AudioFileClip, VideoClip, TextClip, CompositeVideoClip
+import psutil
+from mutagen import File as MutagenFile
+import imageio
+import json
+import threading
+
+CONFIG_FILE = 'audiovisualizer_config.json'
+
+def load_config():
+    if os.path.exists(CONFIG_FILE):
+        try:
+            with open(CONFIG_FILE, 'r') as f:
+                return json.load(f)
+        except:
+            pass
+    return {}
+
+def save_config(config):
+    try:
+        with open(CONFIG_FILE, 'w') as f:
+            json.dump(config, f)
+    except:
+        pass
+
+
+class ExportDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Export Options")
+        layout = QVBoxLayout()
+        
+        # Format
+        format_layout = QHBoxLayout()
+        format_layout.addWidget(QLabel("Format:"))
+        self.format_combo = QComboBox()
+        self.format_combo.addItems(['MP4', 'GIF', 'WebM'])
+        format_layout.addWidget(self.format_combo)
+        layout.addLayout(format_layout)
+        
+        # Resolution
+        res_layout = QHBoxLayout()
+        res_layout.addWidget(QLabel("Width:"))
+        self.width_spin = QSpinBox()
+        self.width_spin.setRange(640, 3840)
+        self.width_spin.setValue(1920)
+        res_layout.addWidget(self.width_spin)
+        res_layout.addWidget(QLabel("Height:"))
+        self.height_spin = QSpinBox()
+        self.height_spin.setRange(480, 2160)
+        self.height_spin.setValue(1080)
+        res_layout.addWidget(self.height_spin)
+        layout.addLayout(res_layout)
+        
+        # Framerate
+        fps_layout = QHBoxLayout()
+        fps_layout.addWidget(QLabel("Framerate:"))
+        self.fps_spin = QSpinBox()
+        self.fps_spin.setRange(10, 60)
+        self.fps_spin.setValue(30)
+        fps_layout.addWidget(self.fps_spin)
+        layout.addLayout(fps_layout)
+        
+        # Overlay text
+        overlay_layout = QHBoxLayout()
+        overlay_layout.addWidget(QLabel("Overlay Text:"))
+        self.overlay_edit = QLineEdit()
+        overlay_layout.addWidget(self.overlay_edit)
+        layout.addLayout(overlay_layout)
+        
+        # Batch
+        self.batch_check = QCheckBox("Batch Export")
+        layout.addWidget(self.batch_check)
+        
+        # Output path
+        path_layout = QHBoxLayout()
+        self.path_edit = QLineEdit()
+        path_layout.addWidget(self.path_edit)
+        browse_btn = QPushButton("Browse")
+        browse_btn.clicked.connect(self.browse)
+        path_layout.addWidget(browse_btn)
+        layout.addLayout(path_layout)
+        
+        # Buttons
+        btn_layout = QHBoxLayout()
+        ok_btn = QPushButton("OK")
+        ok_btn.clicked.connect(self.accept)
+        btn_layout.addWidget(ok_btn)
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.clicked.connect(self.reject)
+        btn_layout.addWidget(cancel_btn)
+        layout.addLayout(btn_layout)
+        
+        self.setLayout(layout)
+    
+    def browse(self):
+        path, _ = QFileDialog.getSaveFileName(self, "Save As", "", "Video Files (*.mp4 *.gif *.webm)")
+        if path:
+            self.path_edit.setText(path)
+    
+    def get_options(self):
+        return {
+            'format': self.format_combo.currentText(),
+            'width': self.width_spin.value(),
+            'height': self.height_spin.value(),
+            'fps': self.fps_spin.value(),
+            'overlay_text': self.overlay_edit.text().strip(),
+            'batch': self.batch_check.isChecked(),
+            'out_path': self.path_edit.text()
+        }
 
 
 class ModernUploadWizard(QWidget):
@@ -317,6 +428,35 @@ class CenteredScrollingPlayer(QMainWindow):
         except Exception:
             pass
 
+        # Customization attributes
+        self.wave_style = 'Line'
+        self.wave_color = '#00d4ff'
+        self.wave_thickness = 2
+        self.wave_opacity = 1.0
+        self.animation_speed = 1.0
+        self.current_theme = 'Default'
+        self.chapters = []
+        self.chapter_lines = []
+        self.wave_artist = None
+
+        self.themes = {
+            'Default': {'bg': '#0f172a', 'text': '#94a3b8', 'wave': '#00d4ff', 'playhead': '#f43f5e'},
+            'Dark Blue': {'bg': '#1e293b', 'text': '#cbd5e1', 'wave': '#3b82f6', 'playhead': '#ef4444'},
+            'Green': {'bg': '#0f172a', 'text': '#94a3b8', 'wave': '#10b981', 'playhead': '#f59e0b'},
+            'Purple': {'bg': '#2d1b69', 'text': '#a78bfa', 'wave': '#8b5cf6', 'playhead': '#f97316'},
+        }
+
+        self.memory_timer = QTimer()
+        self.memory_timer.timeout.connect(self.update_memory)
+        self.memory_timer.start(5000)
+        self.memory_label = QLabel("Memory: N/A")
+
+        self.save_timer = QTimer()
+        self.save_timer.timeout.connect(self.save_position)
+        self.save_timer.start(10000)
+
+        self.config = load_config()
+
         # Apply modern styling to main window
         self.setStyleSheet("""
             QMainWindow {
@@ -441,6 +581,71 @@ class CenteredScrollingPlayer(QMainWindow):
         self.status = QLabel("Ready to play")
         self.status.setStyleSheet("color: #4ade80; font-weight: 500; font-size: 14px;")
         ctrl_layout.addWidget(self.status)
+        
+        # Customization controls
+        custom_group = QGroupBox("Waveform Customization")
+        custom_layout = QVBoxLayout()
+        
+        # Style
+        style_layout = QHBoxLayout()
+        style_layout.addWidget(QLabel("Style:"))
+        self.style_combo = QComboBox()
+        self.style_combo.addItems(['Line', 'Bars', 'Dots', 'Filled'])
+        self.style_combo.currentTextChanged.connect(self.update_style)
+        style_layout.addWidget(self.style_combo)
+        custom_layout.addLayout(style_layout)
+        
+        # Color
+        color_layout = QHBoxLayout()
+        color_layout.addWidget(QLabel("Color:"))
+        self.color_btn = QPushButton("Choose Color")
+        self.color_btn.clicked.connect(self.choose_color)
+        color_layout.addWidget(self.color_btn)
+        custom_layout.addLayout(color_layout)
+        
+        # Thickness
+        thickness_layout = QHBoxLayout()
+        thickness_layout.addWidget(QLabel("Thickness:"))
+        self.thickness_slider = QSlider(Qt.Orientation.Horizontal)
+        self.thickness_slider.setRange(1, 10)
+        self.thickness_slider.setValue(2)
+        self.thickness_slider.valueChanged.connect(self.update_thickness)
+        thickness_layout.addWidget(self.thickness_slider)
+        custom_layout.addLayout(thickness_layout)
+        
+        # Opacity
+        opacity_layout = QHBoxLayout()
+        opacity_layout.addWidget(QLabel("Opacity:"))
+        self.opacity_slider = QSlider(Qt.Orientation.Horizontal)
+        self.opacity_slider.setRange(1, 100)
+        self.opacity_slider.setValue(100)
+        self.opacity_slider.valueChanged.connect(self.update_opacity)
+        opacity_layout.addWidget(self.opacity_slider)
+        custom_layout.addLayout(opacity_layout)
+        
+        # Animation Speed
+        speed_layout = QHBoxLayout()
+        speed_layout.addWidget(QLabel("Animation Speed:"))
+        self.speed_slider = QSlider(Qt.Orientation.Horizontal)
+        self.speed_slider.setRange(50, 200)
+        self.speed_slider.setValue(100)
+        self.speed_slider.valueChanged.connect(self.update_speed)
+        speed_layout.addWidget(self.speed_slider)
+        custom_layout.addLayout(speed_layout)
+        
+        # Theme
+        theme_layout = QHBoxLayout()
+        theme_layout.addWidget(QLabel("Theme:"))
+        self.theme_combo = QComboBox()
+        self.theme_combo.addItems(list(self.themes.keys()))
+        self.theme_combo.currentTextChanged.connect(self.apply_theme)
+        theme_layout.addWidget(self.theme_combo)
+        custom_layout.addLayout(theme_layout)
+        
+        custom_group.setLayout(custom_layout)
+        ctrl_layout.addWidget(custom_group)
+        
+        ctrl_layout.addWidget(self.memory_label)
         
         layout.addWidget(controls)
 
@@ -713,6 +918,114 @@ class CenteredScrollingPlayer(QMainWindow):
         self.slider.blockSignals(False)
 
         self.canvas.draw_idle()
+
+    def update_style(self, style):
+        self.wave_style = style
+        self.update_plot(self.player.position())
+
+    def choose_color(self):
+        color = QColorDialog.getColor(QColor(self.wave_color), self)
+        if color.isValid():
+            self.wave_color = color.name()
+            self.update_plot(self.player.position())
+
+    def update_thickness(self, val):
+        self.wave_thickness = val
+        self.update_plot(self.player.position())
+
+    def update_opacity(self, val):
+        self.wave_opacity = val / 100.0
+        self.update_plot(self.player.position())
+
+    def update_speed(self, val):
+        self.animation_speed = val / 100.0
+        self.window_sec = 10.0 * self.animation_speed
+        self.half_window = self.window_sec / 2
+        self.update_plot(self.player.position())
+
+    def apply_theme(self, theme):
+        self.current_theme = theme
+        colors = self.themes[theme]
+        self.ax.set_facecolor(colors['bg'])
+        self.canvas.figure.set_facecolor(colors['bg'])
+        self.ax.tick_params(colors=colors['text'])
+        self.ax.xaxis.label.set_color(colors['text'])
+        self.line.set_color(colors['wave'])
+        self.playhead.set_color(colors['playhead'])
+        self.canvas.draw_idle()
+
+    def update_memory(self):
+        try:
+            process = psutil.Process()
+            mem = process.memory_info().rss / 1024 / 1024
+            self.memory_label.setText(f"Memory: {mem:.1f} MB")
+        except:
+            self.memory_label.setText("Memory: N/A")
+
+    def save_position(self):
+        if self.player.source().isValid():
+            file_path = self.player.source().toLocalFile()
+            if 'last_position' not in self.config:
+                self.config['last_position'] = {}
+            self.config['last_position'][file_path] = self.player.position()
+            save_config(self.config)
+
+    def closeEvent(self, event):
+        self.save_config()
+        super().closeEvent(event)
+
+    def save_config(self):
+        self.config['wave_style'] = self.wave_style
+        self.config['wave_color'] = self.wave_color
+        self.config['wave_thickness'] = self.wave_thickness
+        self.config['wave_opacity'] = self.wave_opacity
+        self.config['animation_speed'] = self.animation_speed
+        self.config['current_theme'] = self.current_theme
+        save_config(self.config)
+
+    def load_config(self):
+        self.config = load_config()
+        self.wave_style = self.config.get('wave_style', 'Line')
+        self.wave_color = self.config.get('wave_color', '#00d4ff')
+        self.wave_thickness = self.config.get('wave_thickness', 2)
+        self.wave_opacity = self.config.get('wave_opacity', 1.0)
+        self.animation_speed = self.config.get('animation_speed', 1.0)
+        self.current_theme = self.config.get('current_theme', 'Default')
+        # Apply
+        self.style_combo.setCurrentText(self.wave_style)
+        self.thickness_slider.setValue(self.wave_thickness)
+        self.opacity_slider.setValue(int(self.wave_opacity * 100))
+        self.speed_slider.setValue(int(self.animation_speed * 100))
+        self.theme_combo.setCurrentText(self.current_theme)
+        self.apply_theme(self.current_theme)
+        self.update_recent_menu()
+
+    def update_recent_menu(self):
+        self.recent_menu.clear()
+        for file in self.config.get('recent_files', []):
+            action = QAction(file, self)
+            action.triggered.connect(lambda checked, f=file: self.load_recent(f))
+            self.recent_menu.addAction(action)
+
+    def load_recent(self, path):
+        if os.path.exists(path):
+            self.load_file_from_path(path)
+        else:
+            QMessageBox.warning(self, "File Not Found", f"The file {path} was not found.")
+
+    def dragEnterEvent(self, event):
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+
+    def dropEvent(self, event):
+        urls = event.mimeData().urls()
+        for url in urls:
+            path = url.toLocalFile()
+            if path.lower().endswith(('.mp3', '.wav', '.m4a', '.flac', '.ogg', '.aac')):
+                self.load_file_from_path(path)
+                break
+            elif path.lower().endswith(('.png', '.jpg', '.jpeg')):
+                self.apply_theme_from_image(path)
 
     def make_frame(self, t):
         pos_ms = int(t * 1000)
