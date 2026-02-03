@@ -82,6 +82,12 @@ class AudioVisualizer:
         self.animation_speed = 1.0
         self.current_theme = 'Default'
 
+        # Chapters
+        self.chapters = []  # list of (start_time, title)
+
+        # Export options
+        self.export_title = "My Audio Visualizer"
+
         self.themes = {
             'Default': {'bg': '#0f172a', 'text': '#94a3b8', 'wave': '#00d4ff', 'playhead': '#f43f5e'},
             'Dark Blue': {'bg': '#1e293b', 'text': '#cbd5e1', 'wave': '#3b82f6', 'playhead': '#ef4444'},
@@ -112,8 +118,21 @@ class AudioVisualizer:
         self.config['current_theme'] = self.current_theme
         save_config(self.config)
 
-    @staticmethod
-    def process_audio(path):
+    def extract_chapters(self, path):
+        """Extract chapter metadata from audio file."""
+        try:
+            audio = MutagenFile(path)
+            if audio is None:
+                return
+            if hasattr(audio, 'chapters'):
+                self.chapters = []
+                for chapter in audio.chapters:
+                    start = chapter.start_time / 1000.0  # convert ms to s
+                    title = chapter.title or f"Chapter {len(self.chapters)+1}"
+                    self.chapters.append((start, title))
+            # Fallback for other formats if needed
+        except Exception:
+            pass
         """Try to load audio with librosa, fallback to moviepy if needed."""
         try:
             y, sr = librosa.load(path, sr=None, mono=True)
@@ -158,20 +177,28 @@ class AudioVisualizer:
         line, = ax.plot([], [], color=colors['wave'], lw=self.wave_thickness, alpha=self.wave_opacity)
         playhead = ax.axvline(0, color=colors['playhead'], lw=2.5, ls='--', alpha=0.9)
 
+        # Add chapter markers
+        chapter_lines = []
+        for start, title in self.chapters:
+            if 0 <= start <= self.duration:
+                line = ax.axvline(start, color='#fbbf24', lw=1.5, ls='-', alpha=0.7)
+                chapter_lines.append(line)
+
         ax.set_xlim(0, self.window_sec)
         ax.set_ylim(-1.1, 1.1)
         ax.set_xlabel("Time (s)", color=colors['text'], fontsize=11)
 
-        return fig, ax, line, playhead
+        return fig, ax, line, playhead, chapter_lines
 
     def build_visualizer_ui(self):
         ui.label('🎵 Audio Visualizer').style('font-size: 24px; font-weight: bold; color: #00d4ff; text-align: center;')
 
         # Plot
-        fig, ax, line, playhead = self.create_plot()
+        fig, ax, line, playhead, chapter_lines = self.create_plot()
         self.ax = ax
         self.line = line
         self.playhead = playhead
+        self.chapter_lines = chapter_lines
         self.plot = ui.pyplot()
         self.plot.figure = fig
 
@@ -217,6 +244,10 @@ class AudioVisualizer:
                 ui.slider(min=50, max=200, value=int(self.animation_speed * 100), on_change=lambda e: self.update_speed(e.value)).props('label=Animation Speed')
                 ui.select(list(self.themes.keys()), value=self.current_theme, on_change=lambda e: self.apply_theme(e.value)).props('label=Theme')
 
+        # Export options
+        with ui.expansion('Export Options').classes('w-full'):
+            ui.input(label='Video Title', value=self.export_title, on_change=lambda e: setattr(self, 'export_title', e.value))
+
     def update_plot(self, current_sec):
         if self.samples is None or self.plot is None:
             return
@@ -232,7 +263,29 @@ class AudioVisualizer:
             return
 
         t = np.linspace(start_idx / self.sr, (start_idx + len(visible)) / self.sr, len(visible))
-        self.line.set_data(t, visible)
+
+        # Clear previous wave artists
+        if hasattr(self, 'wave_artists'):
+            for artist in self.wave_artists:
+                artist.remove()
+        self.wave_artists = []
+
+        colors = self.themes[self.current_theme]
+        if self.wave_style == 'Line':
+            line, = self.ax.plot(t, visible, color=self.wave_color, lw=self.wave_thickness, alpha=self.wave_opacity)
+            self.wave_artists.append(line)
+        elif self.wave_style == 'Bars':
+            # Downsample for bars
+            bar_width = (t[-1] - t[0]) / len(visible)
+            bars = self.ax.bar(t, np.abs(visible), width=bar_width, color=self.wave_color, alpha=self.wave_opacity, align='center')
+            self.wave_artists.extend(bars)
+        elif self.wave_style == 'Dots':
+            dots = self.ax.scatter(t, visible, color=self.wave_color, s=self.wave_thickness*10, alpha=self.wave_opacity)
+            self.wave_artists.append(dots)
+        elif self.wave_style == 'Filled':
+            fill = self.ax.fill_between(t, 0, visible, color=self.wave_color, alpha=self.wave_opacity)
+            self.wave_artists.append(fill)
+
         self.ax.set_xlim(start_sec, end_sec)
         self.playhead.set_xdata((current_sec, current_sec))
 
@@ -364,6 +417,9 @@ class AudioVisualizer:
         self.current_time = 0
         self.audio_ready = True
 
+        # Extract chapters
+        self.extract_chapters(self.audio_path)
+
         # Update slider
         self.slider._props['max'] = self.duration
         self.slider.update()
@@ -453,8 +509,12 @@ class AudioVisualizer:
 
     def update_style(self, style):
         self.wave_style = style
-        # For simplicity, keep as line for now
-        # Could implement different plot types
+        # Clear existing artists
+        if hasattr(self, 'wave_artists'):
+            for artist in self.wave_artists:
+                artist.remove()
+        self.wave_artists = []
+        # Re-plot with new style
         self.update_plot(self.current_time)
 
     def choose_color(self, color):
@@ -487,6 +547,10 @@ class AudioVisualizer:
         self.ax.xaxis.label.set_color(colors['text'])
         self.line.set_color(colors['wave'])
         self.playhead.set_color(colors['playhead'])
+        # Re-add chapter lines
+        if hasattr(self, 'chapter_lines'):
+            for line in self.chapter_lines:
+                line.set_color('#fbbf24')
         # Re-add image if present
         if self.image_path:
             try:
@@ -575,6 +639,19 @@ class AudioVisualizer:
 
         self.last_export_path = out_path
         self.status_label.text = f"✓ Exported: {out_path}"
+
+        # Add text overlay if title provided
+        if self.export_title and self.export_title.strip():
+            try:
+                from moviepy.editor import VideoFileClip, TextClip
+                video_clip = VideoFileClip(out_path)
+                txt_clip = TextClip(self.export_title, fontsize=70, color='white', bg_color='black', size=video_clip.size).set_position('center').set_duration(video_clip.duration)
+                final_clip = video_clip.set_audio(video_clip.audio).overlay(txt_clip, keep_duration=True)
+                final_clip.write_videofile(out_path.replace('.mp4', '_with_title.mp4'), codec='libx264', audio_codec='aac', fps=30)
+                self.last_export_path = out_path.replace('.mp4', '_with_title.mp4')
+                self.status_label.text = f"✓ Exported with title: {self.last_export_path}"
+            except Exception as ex:
+                self.status_label.text = f"✓ Exported (text overlay failed: {ex}): {out_path}"
 
     def download_last_export(self):
         if not self.last_export_path or not os.path.exists(self.last_export_path):
