@@ -1,21 +1,21 @@
-# 🎵 Audio Visualizer - Modern Edition
+# 🎵 Audio Visualizer - Web Edition
 
-A modern, beautiful audio visualizer built with PyQt6 that creates stunning waveform visualizations with optional background images.
+A modern, web-based audio visualizer built with NiceGUI that creates stunning waveform visualizations with optional background images.
 
 ## ✨ Features
 
-- **Modern Upload Wizard**: Step-by-step interface for uploading audio and image files
+- **Web Upload Interface**: Drag-and-drop or click to upload audio and image files
 - **Beautiful UI**: Gradient backgrounds, modern colors, and smooth animations
 - **Audio Support**: Works with MP3, WAV, M4A, FLAC, OGG, AAC and more
 - **Image Themes**: Apply background images that influence the waveform colors
 - **Real-time Playback**: Watch the waveform scroll as your audio plays
 - **Video Export**: Export your visualization as an MP4 video file
-- **Seamless Workflow**: Confirm uploads before proceeding to the visualizer
+- **Seamless Workflow**: Upload files and start visualizing immediately
 
 ## 📋 Requirements
 
 - Python 3.8+
-- PyQt6
+- nicegui
 - numpy
 - librosa
 - matplotlib
@@ -26,7 +26,7 @@ A modern, beautiful audio visualizer built with PyQt6 that creates stunning wave
 
 1. Clone the repository:
 ```bash
-git clone https://github.com/tpC529/audiovisualizer.git
+git clone https://github.com/your-repo/audiovisualizer.git
 cd audiovisualizer
 ```
 
@@ -37,19 +37,19 @@ pip install -r requirements.txt
 
 ## 🎮 Usage
 
-1. Run the application:
+1. Run the web server:
 ```bash
 python wavefile.py
 ```
 
-2. The modern upload wizard will appear:
-   - **Step 1**: Click "📁 Choose Audio File" and select your audio file
-   - **Step 2**: Optionally click "📁 Choose Image File" for a background theme
-   - Click "Continue" to launch the visualizer
+2. Open your browser to http://localhost:8080
 
-3. In the main player:
+3. Upload your files:
+   - **Upload Audio**: Select an audio file (MP3, WAV, M4A, etc.)
+   - **Upload Image**: Optionally select an image for background theme
+
+4. Control playback:
    - **▶️ Play / Pause**: Control audio playback
-   - **🖼️ Change Background Image**: Update the background image anytime
    - **🎬 Export Video**: Save your visualization as an MP4 file
    - **Slider**: Seek through the audio
 
@@ -59,15 +59,12 @@ python wavefile.py
 - Cyan waveform that adapts to image colors
 - Modern rounded buttons with hover effects
 - Clean, minimalist interface
-- Real-time status updates with icons
-- Responsive layout
+- Real-time status updates
+- Responsive web layout
 
-## 🌐 Deployment Ready
+## 🌐 Web Deployment Ready
 
-The application includes:
-- `requirements.txt` for easy dependency management
-- `.gitignore` for clean version control
-- Modular code structure for easy customization
+The application runs as a web server and can be deployed to any platform supporting Python.
 
 ## 📝 Notes
 
