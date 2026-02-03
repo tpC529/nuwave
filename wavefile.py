@@ -3,19 +3,32 @@ import numpy as np
 import librosa
 import matplotlib.pyplot as plt
 from PIL import Image
-import nicegui as ui
+from nicegui import ui
 from nicegui import events
-import moviepy.editor as mp
+import ffmpeg
 import psutil
+from pydub import AudioSegment
 from mutagen import File as MutagenFile
 import imageio
+import imageio_ffmpeg
 import json
 import asyncio
 import threading
 import tempfile
 import base64
 
+# Configure bundled FFmpeg from imageio_ffmpeg globally before any use
+try:
+    _ffmpeg_path = imageio_ffmpeg.get_ffmpeg_exe()
+    os.environ['FFMPEG_BINARY'] = _ffmpeg_path
+    os.environ['PATH'] = os.path.dirname(_ffmpeg_path) + os.pathsep + os.environ.get('PATH', '')
+    AudioSegment.converter = _ffmpeg_path
+    AudioSegment.ffmpeg = _ffmpeg_path
+except Exception as e:
+    print(f"Warning: Could not set up bundled FFmpeg: {e}")
+
 CONFIG_FILE = 'audiovisualizer_config.json'
+CURRENT_VISUALIZER = None
 
 def load_config():
     if os.path.exists(CONFIG_FILE):
@@ -44,6 +57,22 @@ class AudioVisualizer:
         self.is_playing = False
         self.window_sec = 10.0
         self.half_window = self.window_sec / 2
+
+        self.audio_b64 = None
+        self.audio_type = None
+        self.visualizer_opened = False
+        self.last_export_path = None
+        self.see_episode_button = None
+
+        # Use the globally configured FFmpeg path
+        try:
+            self.ffmpeg_cmd = imageio_ffmpeg.get_ffmpeg_exe()
+        except Exception:
+            self.ffmpeg_cmd = 'ffmpeg'
+
+        # Upload readiness
+        self.audio_ready = False
+        self.image_ready = False
 
         # Customization
         self.wave_style = 'Line'
@@ -91,13 +120,16 @@ class AudioVisualizer:
             return np.asarray(y, dtype=np.float32), int(sr)
         except Exception:
             try:
-                clip = mp.AudioFileClip(path)
-                sr = int(clip.fps)
-                arr = clip.to_soundarray()
-                clip.close()
-                if arr.ndim == 2:
-                    arr = arr.mean(axis=1)
-                return np.asarray(arr, dtype=np.float32), sr
+                audio = AudioSegment.from_file(path)
+                sr = int(audio.frame_rate)
+                samples = np.array(audio.get_array_of_samples())
+                # handle stereo
+                if audio.channels > 1:
+                    samples = samples.reshape((-1, audio.channels)).mean(axis=1)
+                # normalize according to sample width
+                max_val = float(2 ** (8 * audio.sample_width - 1))
+                samples = samples.astype(np.float32) / max_val
+                return samples, sr
             except Exception:
                 return None, None
 
@@ -110,6 +142,19 @@ class AudioVisualizer:
         ax.xaxis.label.set_color(colors['text'])
         ax.grid(alpha=0.15, color='#334155')
 
+        # Add image background if available
+        if self.image_path and os.path.exists(self.image_path):
+            try:
+                img = Image.open(self.image_path).convert('RGBA')
+                img_array = np.array(img)
+                # Resize to fit the plot area
+                img_resized = img.resize((1200, 600), Image.Resampling.LANCZOS)
+                img_array = np.array(img_resized)
+                # Display as background with low alpha
+                ax.imshow(img_array, extent=[0, self.window_sec, -1.1, 1.1], aspect='auto', alpha=0.2, zorder=-1)
+            except Exception:
+                pass
+
         line, = ax.plot([], [], color=colors['wave'], lw=self.wave_thickness, alpha=self.wave_opacity)
         playhead = ax.axvline(0, color=colors['playhead'], lw=2.5, ls='--', alpha=0.9)
 
@@ -118,6 +163,59 @@ class AudioVisualizer:
         ax.set_xlabel("Time (s)", color=colors['text'], fontsize=11)
 
         return fig, ax, line, playhead
+
+    def build_visualizer_ui(self):
+        ui.label('🎵 Audio Visualizer').style('font-size: 24px; font-weight: bold; color: #00d4ff; text-align: center;')
+
+        # Plot
+        fig, ax, line, playhead = self.create_plot()
+        self.ax = ax
+        self.line = line
+        self.playhead = playhead
+        self.plot = ui.pyplot()
+        self.plot.figure = fig
+
+        # Audio element
+        self.audio_element = ui.html('<audio id="audio" controls style="width:100%;"></audio>', sanitize=False)
+        if self.audio_b64 and self.audio_type:
+            self.audio_element.content = f'''
+            <audio id="audio" controls style="width:100%;" ontimeupdate="updateTime(this.currentTime)">
+            <source src="data:{self.audio_type};base64,{self.audio_b64}" type="{self.audio_type}">
+            </audio>
+            <script>
+            function updateTime(time) {{
+                // This will be handled by NiceGUI events
+            }}
+            </script>
+            '''
+
+        # Controls
+        with ui.row():
+            ui.button('▶️ Play / Pause', on_click=self.toggle_play)
+            ui.button('⏹️ Stop', on_click=self.stop_audio)
+            ui.button('💾 Export & Download MP4', on_click=self.export_and_download)
+
+        # Slider and Volume
+        with ui.row():
+            self.slider = ui.slider(min=0, max=100, value=0, on_change=lambda e: self.on_slider_change(e.value))
+            self.volume_slider = ui.slider(min=0, max=100, value=100, on_change=lambda e: self.set_volume(e.value))
+
+        # Status
+        self.status_label = ui.label("Visualizer loading...").style('color: #4ade80; font-weight: 500;')
+
+        # Customization
+        with ui.expansion('Waveform Customization').classes('w-full'):
+            with ui.row():
+                ui.select(['Line', 'Bars', 'Dots', 'Filled'], value='Line', on_change=lambda e: self.update_style(e.value)).props('label=Style')
+                ui.color_input(value=self.wave_color, on_change=lambda e: self.choose_color(e.value)).props('label=Color')
+
+            with ui.row():
+                ui.slider(min=1, max=10, value=self.wave_thickness, on_change=lambda e: self.update_thickness(e.value)).props('label=Thickness')
+                ui.slider(min=1, max=100, value=int(self.wave_opacity * 100), on_change=lambda e: self.update_opacity(e.value)).props('label=Opacity')
+
+            with ui.row():
+                ui.slider(min=50, max=200, value=int(self.animation_speed * 100), on_change=lambda e: self.update_speed(e.value)).props('label=Animation Speed')
+                ui.select(list(self.themes.keys()), value=self.current_theme, on_change=lambda e: self.apply_theme(e.value)).props('label=Theme')
 
     def update_plot(self, current_sec):
         if self.samples is None or self.plot is None:
@@ -145,6 +243,51 @@ class AudioVisualizer:
 
         self.plot.update()
 
+    def prepare_visualization(self, open_window: bool = True):
+        """Ensure UI and plot are configured once audio and image are loaded."""
+        if not (self.audio_ready and self.image_ready):
+            return
+        # Update duration/slider if samples present
+        if self.samples is not None:
+            self.duration = len(self.samples) / self.sr if self.sr else 0
+            if hasattr(self, 'slider') and self.slider is not None:
+                self.slider._props['max'] = self.duration
+                self.slider.value = 0
+                self.slider.update()
+
+        # Apply image-based theme if image is present
+        if getattr(self, 'image_path', None):
+            try:
+                self.apply_theme_from_image(self.image_path)
+            except Exception:
+                pass
+
+        # Redraw plot at start
+        try:
+            self.update_plot(0)
+        except Exception:
+            pass
+
+        # Reveal visualizer and hide loading indicator
+        try:
+            if hasattr(self, 'visualizer_container') and self.visualizer_container is not None:
+                self.visualizer_container.classes(remove='hidden')
+            if hasattr(self, 'loading_indicator') and self.loading_indicator is not None:
+                self.loading_indicator.classes(add='hidden')
+        except Exception:
+            pass
+
+        if hasattr(self, 'status_label') and self.status_label is not None:
+            self.status_label.text = "✓ Visualizer ready"
+        if self.see_episode_button is not None:
+            self.see_episode_button.enable()
+
+        global CURRENT_VISUALIZER
+        CURRENT_VISUALIZER = self
+        if open_window and not self.visualizer_opened:
+            self.visualizer_opened = True
+            ui.run_javascript("window.open('/visualizer','_blank')")
+
     def apply_theme_from_image(self, img_path):
         img = Image.open(img_path).convert('RGBA')
         small = img.resize((64, 64))
@@ -170,21 +313,39 @@ class AudioVisualizer:
             bg_color = '#1e293b'
             text_color = '#cbd5e1'
 
+        self.image_path = img_path
+
+        if not hasattr(self, 'ax') or self.ax is None or self.plot is None:
+            return
+
         self.ax.set_facecolor(bg_color)
         self.plot.fig.patch.set_facecolor(bg_color)
         self.ax.tick_params(colors=text_color)
         self.ax.xaxis.label.set_color(text_color)
+        self.wave_color = '#%02x%02x%02x' % (int(wave_rgb[0]*255), int(wave_rgb[1]*255), int(wave_rgb[2]*255))
         self.line.set_color(wave_rgb)
         self.playhead.set_color('#f43f5e')
+        # Re-add image background
+        try:
+            img = Image.open(self.image_path).convert('RGBA')
+            img_array = np.array(img)
+            img_resized = img.resize((1200, 600), Image.Resampling.LANCZOS)
+            img_array = np.array(img_resized)
+            # Clear previous images
+            for img_artist in self.ax.images:
+                img_artist.remove()
+            self.ax.imshow(img_array, extent=[0, self.window_sec, -1.1, 1.1], aspect='auto', alpha=0.2, zorder=-1)
+        except Exception:
+            pass
         self.plot.update()
-
-        self.image_path = img_path
 
     async def on_audio_upload(self, e: events.UploadEventArguments):
         if e.content is None:
             return
 
         # Save uploaded file temporarily
+        if hasattr(self, 'loading_indicator') and self.loading_indicator is not None:
+            self.loading_indicator.classes(remove='hidden')
         with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(e.name)[1]) as tmp:
             tmp.write(e.content.read())
             self.audio_path = tmp.name
@@ -194,13 +355,14 @@ class AudioVisualizer:
 
         samples, sr = self.process_audio(self.audio_path)
         if samples is None:
-            self.status_label.text = "❌ Failed to load audio"
+            self.status_label.text = "❌ Failed to load audio (install FFmpeg or imageio-ffmpeg)"
             return
 
         self.samples = samples
         self.sr = sr
         self.duration = len(samples) / sr
         self.current_time = 0
+        self.audio_ready = True
 
         # Update slider
         self.slider._props['max'] = self.duration
@@ -210,20 +372,28 @@ class AudioVisualizer:
         with open(self.audio_path, 'rb') as f:
             audio_data = base64.b64encode(f.read()).decode()
         audio_type = 'audio/wav' if self.audio_path.endswith('.wav') else 'audio/mpeg'
-        self.audio_element.content = f'''
-        <audio id="audio" controls style="width:100%;" ontimeupdate="updateTime(this.currentTime)">
-        <source src="data:{audio_type};base64,{audio_data}" type="{audio_type}">
-        </audio>
-        <script>
-        function updateTime(time) {{
-            // This will be handled by NiceGUI events
-        }}
-        </script>
-        '''
+        self.audio_b64 = audio_data
+        self.audio_type = audio_type
+
+        if hasattr(self, 'audio_element') and self.audio_element is not None:
+            self.audio_element.content = f'''
+            <audio id="audio" controls style="width:100%;" ontimeupdate="updateTime(this.currentTime)">
+            <source src="data:{self.audio_type};base64,{self.audio_b64}" type="{self.audio_type}">
+            </audio>
+            <script>
+            function updateTime(time) {{
+                // This will be handled by NiceGUI events
+            }}
+            </script>
+            '''
 
         filename = e.name
-        self.status_label.text = f"✓ Loaded: {filename}"
-        self.update_plot(0)
+        self.status_label.text = f"✓ Loaded audio: {filename}"
+        # Configure visualization now that audio is loaded
+        try:
+            self.prepare_visualization(open_window=True)
+        except Exception:
+            pass
 
     async def on_image_upload(self, e: events.UploadEventArguments):
         if e.content is None:
@@ -234,9 +404,17 @@ class AudioVisualizer:
             img_path = tmp.name
 
         try:
+            if hasattr(self, 'loading_indicator') and self.loading_indicator is not None:
+                self.loading_indicator.classes(remove='hidden')
             self.apply_theme_from_image(img_path)
             filename = e.name
             self.status_label.text = f"✓ Image applied: {filename}"
+            self.image_ready = True
+            # If audio already loaded, configure the visualization
+            try:
+                self.prepare_visualization(open_window=True)
+            except Exception:
+                pass
         except Exception as ex:
             self.status_label.text = f"❌ Failed to apply image: {str(ex)}"
 
@@ -250,6 +428,14 @@ class AudioVisualizer:
             self.start_playback_timer()
             self.is_playing = True
 
+    def stop_audio(self):
+        ui.run_javascript('document.getElementById("audio").pause(); document.getElementById("audio").currentTime = 0;')
+        self.stop_playback_timer()
+        self.is_playing = False
+        self.current_time = 0
+        self.slider.value = 0
+        self.update_plot(0)
+
     def update_time(self, time):
         self.current_time = time
         self.slider.value = time
@@ -260,6 +446,10 @@ class AudioVisualizer:
         # Update audio position via JavaScript
         ui.run_javascript(f'document.getElementById("audio").currentTime = {value};')
         self.update_plot(value)
+
+    def set_volume(self, value):
+        volume = value / 100.0
+        ui.run_javascript(f'document.getElementById("audio").volume = {volume};')
 
     def update_style(self, style):
         self.wave_style = style
@@ -297,6 +487,18 @@ class AudioVisualizer:
         self.ax.xaxis.label.set_color(colors['text'])
         self.line.set_color(colors['wave'])
         self.playhead.set_color(colors['playhead'])
+        # Re-add image if present
+        if self.image_path:
+            try:
+                img = Image.open(self.image_path).convert('RGBA')
+                img_array = np.array(img)
+                img_resized = img.resize((1200, 600), Image.Resampling.LANCZOS)
+                img_array = np.array(img_resized)
+                for img_artist in self.ax.images:
+                    img_artist.remove()
+                self.ax.imshow(img_array, extent=[0, self.window_sec, -1.1, 1.1], aspect='auto', alpha=0.2, zorder=-1)
+            except Exception:
+                pass
         self.plot.update()
 
     async def update_playback(self):
@@ -315,81 +517,133 @@ class AudioVisualizer:
             self.playback_timer.cancel()
             self.playback_timer = None
 
+    def update_memory(self):
+        self.memory_label.text = f"Memory: {psutil.virtual_memory().percent}%"
+
     async def export_video(self):
         if self.samples is None:
             return
 
         # Simple export for now
-        out_path = 'output.mp4'  # In web app, perhaps download
+        out_path = 'output.mp4'
 
         self.status_label.text = "⏳ Exporting video..."
         await asyncio.sleep(0.1)
 
-        def make_frame(t):
-            self.update_plot(t)
-            img = np.frombuffer(self.plot.figure.canvas.tostring_rgb(), dtype='uint8')
-            img = img.reshape(self.plot.figure.canvas.get_width_height()[::-1] + (3,))
-            return img
 
-        audio = mp.AudioFileClip(self.audio_path)
-        video = mp.VideoClip(make_frame, duration=self.duration)
-        video = video.set_audio(audio)
-        video.write_videofile(out_path, fps=30, codec='libx264', audio_codec='aac')
+        # Render frames and pipe to ffmpeg for encoding with audio
+        fps = 30
 
+        # Get the matplotlib canvas
+        fig = getattr(self.plot, 'figure', getattr(self.plot, 'fig', None))
+        if fig is None:
+            self.status_label.text = "❌ Failed to access plot figure"
+            return
+        canvas = fig.canvas
+        width, height = canvas.get_width_height()
+
+        video_stream = ffmpeg.input('pipe:0', format='rawvideo', pix_fmt='rgb24', s=f'{width}x{height}', r=fps)
+        audio_stream = ffmpeg.input(self.audio_path)
+
+        process = (
+            ffmpeg
+            .output(video_stream, audio_stream, out_path, pix_fmt='yuv420p', vcodec='libx264', acodec='aac', r=fps)
+            .overwrite_output()
+            .run_async(pipe_stdin=True, cmd=self.ffmpeg_cmd)
+        )
+
+        t = 0.0
+        dt = 1.0 / fps
+        try:
+            while t < self.duration:
+                self.update_plot(t)
+                # draw and grab RGB bytes
+                canvas.draw()
+                frame = np.frombuffer(canvas.tostring_rgb(), dtype='uint8')
+                frame = frame.reshape((height, width, 3))
+                process.stdin.write(frame.tobytes())
+                t += dt
+            process.stdin.close()
+            process.wait()
+        except Exception as ex:
+            try:
+                process.stdin.close()
+            except Exception:
+                pass
+            self.status_label.text = f"❌ Export failed: {ex}"
+            return
+
+        self.last_export_path = out_path
         self.status_label.text = f"✓ Exported: {out_path}"
 
+    def download_last_export(self):
+        if not self.last_export_path or not os.path.exists(self.last_export_path):
+            if self.status_label is not None:
+                self.status_label.text = "❌ No exported video found"
+            return
+        ui.download(self.last_export_path)
+
+    async def export_and_download(self):
+        await self.export_video()
+        self.download_last_export()
+
+@ui.page('/')
 def create_ui():
     visualizer = AudioVisualizer()
 
     with ui.card().style('max-width: 1200px; margin: auto;'):
         ui.label('🎵 Audio Visualizer').style('font-size: 24px; font-weight: bold; color: #00d4ff; text-align: center;')
+        ui.label('The visualizer opens in a new window after both audio and image are uploaded.').style('color: #94a3b8; text-align: center;')
 
         # File uploads
         with ui.row():
-            ui.upload(label='📁 Upload Audio', on_upload=visualizer.on_audio_upload, multiple=False).props('accept=audio/*')
-            ui.upload(label='🖼️ Upload Image', on_upload=visualizer.on_image_upload, multiple=False).props('accept=image/*')
+            ui.upload(
+                label='📁 Upload Audio',
+                on_upload=visualizer.on_audio_upload,
+                multiple=False,
+                auto_upload=True,
+                max_file_size=200_000_000,
+                on_rejected=lambda e: visualizer.status_label.set_text('❌ Audio upload rejected (file too large or invalid)')
+            ).props('accept=audio/*')
+            ui.upload(
+                label='🖼️ Upload Image',
+                on_upload=visualizer.on_image_upload,
+                multiple=False,
+                auto_upload=True,
+                max_file_size=50_000_000,
+                on_rejected=lambda e: visualizer.status_label.set_text('❌ Image upload rejected (file too large or invalid)')
+            ).props('accept=image/*')
 
-        # Plot
-        fig, ax, line, playhead = visualizer.create_plot()
-        visualizer.ax = ax
-        visualizer.line = line
-        visualizer.playhead = playhead
-        visualizer.plot = ui.plot(fig)
-
-        # Audio element
-        visualizer.audio_element = ui.html('<audio id="audio" controls style="width:100%;"></audio>')
-
-        # Controls
-        with ui.row():
-            ui.button('▶️ Play / Pause', on_click=visualizer.toggle_play)
-            ui.button('🎬 Export Video', on_click=visualizer.export_video)
-
-        # Slider
-        visualizer.slider = ui.slider(min=0, max=100, value=0, on_change=lambda e: visualizer.on_slider_change(e.value))
+        # Loading indicator
+        visualizer.loading_indicator = ui.spinner(size='lg')
+        visualizer.loading_indicator.classes('hidden')
 
         # Status
         visualizer.status_label = ui.label("Ready to upload audio").style('color: #4ade80; font-weight: 500;')
+        visualizer.see_episode_button = ui.button('see your episode', on_click=lambda: ui.open('/visualizer'))
+        visualizer.see_episode_button.disable()
 
-        # Customization
-        with ui.expansion('Waveform Customization').classes('w-full'):
-            with ui.row():
-                ui.select(['Line', 'Bars', 'Dots', 'Filled'], value='Line', on_change=lambda e: visualizer.update_style(e.value)).props('label=Style')
-                ui.color_input(value='#00d4ff', on_change=lambda e: visualizer.choose_color(e.value)).props('label=Color')
 
-            with ui.row():
-                ui.slider(min=1, max=10, value=2, on_change=lambda e: visualizer.update_thickness(e.value)).props('label=Thickness')
-                ui.slider(min=1, max=100, value=100, on_change=lambda e: visualizer.update_opacity(e.value)).props('label=Opacity')
+@ui.page('/visualizer')
+def visualizer_page():
+    if CURRENT_VISUALIZER is None or not (CURRENT_VISUALIZER.audio_ready and CURRENT_VISUALIZER.image_ready):
+        ui.label('No visualizer data yet. Please upload audio and an image on the main page.').style('color: #94a3b8;')
+        return
 
-            with ui.row():
-                ui.slider(min=50, max=200, value=100, on_change=lambda e: visualizer.update_speed(e.value)).props('label=Animation Speed')
-                ui.select(list(visualizer.themes.keys()), value='Default', on_change=lambda e: visualizer.apply_theme(e.value)).props('label=Theme')
+    with ui.card().style('max-width: 1200px; margin: auto;'):
+        CURRENT_VISUALIZER.build_visualizer_ui()
+        try:
+            CURRENT_VISUALIZER.prepare_visualization(open_window=False)
+        except Exception:
+            pass
 
-        # Memory
-        visualizer.memory_label = ui.label("Memory: N/A")
+    # Auto-start playback when the visualizer opens
+    try:
+        ui.run_javascript('document.getElementById("audio")?.play();')
+        CURRENT_VISUALIZER.is_playing = True
+        CURRENT_VISUALIZER.start_playback_timer()
+    except Exception:
+        pass
 
-        # Timer for memory updates
-        ui.timer(5.0, callback=lambda: visualizer.update_memory())
-
-if __name__ == '__main__':
-    create_ui()
+if __name__ in ("__main__", "__mp_main__"):
     ui.run(port=8080, title='Audio Visualizer')
