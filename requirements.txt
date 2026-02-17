@@ -7,3 +7,7 @@ moviepy
 psutil
 mutagen
 imageio
+torch
+diffusers
+transformers
+accelerate
