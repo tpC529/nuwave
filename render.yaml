@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: nuwave
+    runtime: python
+    buildCommand: |
+      apt-get update && apt-get install -y ffmpeg
+      pip install -r requirements.txt
+    startCommand: python nuwave_final.py
+    envVars:
+      - key: HF_HUB_DISABLE_SYMLINKS_WARNING
+        value: "1"
+      - key: PYTHON_VERSION
+        value: "3.11"
