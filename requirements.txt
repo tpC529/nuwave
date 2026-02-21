@@ -2,7 +2,7 @@ numpy
 librosa
 matplotlib
 Pillow
-nicegui
+gradio
 moviepy
 psutil
 mutagen
@@ -11,4 +11,4 @@ torch
 diffusers
 transformers
 accelerate
-pydub
+pydub-0.25.1
