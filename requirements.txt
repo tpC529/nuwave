@@ -12,5 +12,5 @@ torch
 diffusers
 transformers
 accelerate
-pydub-0.25.1
+pydub
 os
